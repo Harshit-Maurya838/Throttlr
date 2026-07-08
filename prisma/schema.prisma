@@ -1,0 +1,25 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Algorithm {
+  TOKEN_BUCKET
+  SLIDING_WINDOW
+}
+
+model ClientConfig {
+  clientKey         String    @id @unique
+  algorithm         Algorithm
+  requestsPerSecond Float
+  burstSize         Int
+  windowMs          Int?      // Nullable, used only for SLIDING_WINDOW
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@map("client_configs")
+}
