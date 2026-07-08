@@ -1,5 +1,6 @@
 {
   "name": "rate-limiter-service",
+  "author": "Harshit-Maurya838",
   "version": "1.0.0",
   "description": "Standalone Rate Limiter Service",
   "main": "dist/index.js",
