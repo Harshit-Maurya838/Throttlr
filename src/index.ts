@@ -4,6 +4,7 @@ import { redis } from "./lib/redis";
 import { prisma } from "./lib/prisma";
 import healthRouter from "./routes/health";
 import checkRouter from "./routes/check";
+import adminRouter from "./routes/admin";
 
 const app = express();
 
@@ -12,6 +13,7 @@ app.use(express.json());
 // routers
 app.use(healthRouter);
 app.use(checkRouter);
+app.use(adminRouter);
 
 // bootstrap dependencies and start server
 async function startServer() {

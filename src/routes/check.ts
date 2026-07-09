@@ -1,5 +1,5 @@
-import { Router, Request, Response } from 'express';
-import { getOrCreateBucket } from '../services/bucketStore';
+import { Router, Request, Response } from "express";
+import { getOrCreateBucket, ClientNotConfiguredError, NotImplementedError } from "../services/bucketStore";
 
 const router = Router();
 
@@ -8,23 +8,29 @@ const router = Router();
  * Evaluates whether a request for the specified clientKey should be allowed or denied.
  * Returns JSON metadata including remaining capacity and reset time.
  */
-router.post('/check/:clientKey', (req: Request, res: Response) => {
+router.post("/check/:clientKey", async (req: Request, res: Response) => {
   const { clientKey } = req.params;
   
-  if (!clientKey) {
-    res.status(400).json({ error: 'Client key is required.' });
-    return;
+  try {
+    const bucket = await getOrCreateBucket(clientKey);
+    const result = bucket.tryConsume(Date.now());
+    
+    res.status(200).json({
+      allowed: result.allowed,
+      remaining: result.remaining,
+      limit: bucket.capacity,
+      resetAt: result.resetAt,
+    });
+  } catch (error) {
+    if (error instanceof ClientNotConfiguredError) {
+      res.status(404).json({ error: error.message });
+    } else if (error instanceof NotImplementedError) {
+      res.status(501).json({ error: error.message });
+    } else {
+      console.error("Unexpected error in check route:", error);
+      res.status(500).json({ error: "Internal server error." });
+    }
   }
-
-  const bucket = getOrCreateBucket(clientKey);
-  const result = bucket.tryConsume(Date.now());
-
-  res.status(200).json({
-    allowed: result.allowed,
-    remaining: result.remaining,
-    limit: bucket.capacity,
-    resetAt: result.resetAt,
-  });
 });
 
 export default router;
