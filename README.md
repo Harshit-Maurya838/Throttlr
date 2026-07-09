@@ -38,20 +38,27 @@ Throttlr runs as a centralized shared infrastructure. Consuming APIs and service
   └─────────────┘ └─────────────┘
 ```
 
+### Known Limitations (Phase 2)
+
+- **Unprotected Admin Endpoints**: Admin routes currently have no authentication or API-key protection.
+- **In-Memory Cache Coherency**: Bucket limits are loaded from PostgreSQL only on initial creation. Config changes made via the admin routes do not propagate to already-active in-memory buckets until the server is restarted or the bucket is evicted (this will be resolved with Redis-backed state in Next Phase).
+- **Unsupported Sliding Window Enforcement**: While `SLIDING_WINDOW` client configurations are accepted and stored, the check API will return `501 Not Implemented` if evaluated.
+
 ## Features
 
 ### Currently Implemented
 
 - **Token Bucket Algorithm**: Mathematical token bucket limiter supporting fractional token accumulation and temporal refill.
-- **In-Memory Bucket Store**: Non-persistent in-memory store for client states (used as a testing/development seam).
+- **Per-Client Dynamic Configurations**: Dynamically configures rate limit capacities and refill rates per client key via PostgreSQL database records.
+- **Client Configuration APIs**: `POST /admin/clients/:clientKey` and `GET /admin/clients/:clientKey` endpoints to manage rate limiter parameters.
+- **In-Memory Bucket Store**: Non-persistent in-memory store caching active client buckets (used as a testing/development seam).
 - **Rate Limit Check API**: POST `/check/:clientKey` route for evaluating request admissibility.
 - **Docker Infrastructure**: Multi-container setup orchestrating local PostgreSQL 16 and Redis 7 instances.
 - **Health Check Endpoint**: `/health` API for checking DB and Redis client connectivity status.
 
 ### Planned / Roadmap
 
-- **Sliding Window Log Algorithm**: Sliding window counter-based rate-limiting mode.
-- **Dynamic PostgreSQL Configurations**: Read dynamic, per-client limit rates and capacity sizes from the database.
+- **Sliding Window Log Algorithm**: Sliding window counter-based rate-limiting mode. _(Note: client configurations are accepted, but checks on `SLIDING_WINDOW` clients return `501 Not Implemented` until Phase 5)_.
 - **Redis-Backed Persistence**: Migrate transient token bucket states out of local memory to Redis.
 - **Atomic Lua Scripting**: Atomic check-and-consume operations executed directly in Redis to avoid concurrency race conditions.
 - **Rate Limit Headers**: Return RFC-compliant headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`) on checks.
@@ -115,13 +122,22 @@ Throttlr runs as a centralized shared infrastructure. Consuming APIs and service
 ### Verifying Service
 
 - **Health Check**:
+
   ```bash
   curl http://localhost:3000/health
   ```
-- **Rate Limit Check**:
-  ```bash
-  curl -X POST http://localhost:3000/check/test-client
-  ```
+
+- **Rate Limit Check Flow**:
+  1. Register or update the client configuration via the admin endpoint:
+     ```bash
+     curl -i -X POST -H "Content-Type: application/json" \
+       -d '{"algorithm": "TOKEN_BUCKET", "requestsPerSecond": 2.0, "burstSize": 5}' \
+       http://localhost:3000/admin/clients/my-service
+     ```
+  2. Perform rate limit checks:
+     ```bash
+     curl -i -X POST http://localhost:3000/check/my-service
+     ```
 
 ## Running Tests
 
@@ -148,7 +164,7 @@ rate-limiter-service/
 
 - [x] Phase 0: Project Setup & Architecture
 - [x] Phase 1: Core Token Bucket Algorithm (In-Memory)
-- [ ] Phase 2: PostgreSQL Dynamic Configuration Integration
+- [x] Phase 2: PostgreSQL Dynamic Configuration Integration
 - [ ] Phase 3: Redis-Backed State Store
 - [ ] Phase 4: Concurrency Safety via Lua Scripts
 - [ ] Phase 5: Sliding Window Log Algorithm
