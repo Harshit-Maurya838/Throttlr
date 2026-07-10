@@ -1,7 +1,9 @@
-import { describe, it, expect, beforeEach, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, afterAll, beforeAll, vi } from "vitest";
 import express from "express";
 import request from "supertest";
 import { prisma } from "../../lib/prisma";
+import { redis } from "../../lib/redis";
+import * as redisRepository from "../redisBucketRepository";
 import {
   getClientConfig,
   upsertClientConfig,
@@ -22,15 +24,24 @@ testApp.use(express.json());
 testApp.use(adminRouter);
 testApp.use(checkRouter);
 
-describe("Phase 2 Integration & Unit Tests", () => {
+describe("Phase 3 Integration & Unit Tests", () => {
+  beforeAll(async () => {
+    if (!redis.isOpen) {
+      await redis.connect();
+    }
+  });
+
   // Clear database and in-memory bucket store before each test to ensure isolation
   beforeEach(async () => {
-    clearBuckets();
+    await clearBuckets();
     await prisma.clientConfig.deleteMany();
   });
 
   afterAll(async () => {
     await prisma.$disconnect();
+    if (redis.isOpen) {
+      await redis.quit();
+    }
   });
 
   describe("clientConfigService Unit Tests", () => {
@@ -79,27 +90,154 @@ describe("Phase 2 Integration & Unit Tests", () => {
       );
     });
 
-    it("should create and cache a TokenBucket with correct limits if configured with TOKEN_BUCKET", async () => {
+    it("should create bucket state in Redis and immediately propagate config changes", async () => {
       await upsertClientConfig("token-client", {
         algorithm: Algorithm.TOKEN_BUCKET,
         requestsPerSecond: 3.5,
         burstSize: 7,
       });
 
-      const bucket = await getOrCreateBucket("token-client");
-      expect(bucket.capacity).toBe(7);
-      expect(bucket.refillRatePerSecond).toBe(3.5);
+      const res = await getOrCreateBucket("token-client");
+      expect(res.limit).toBe(7);
+      expect(res.allowed).toBe(true);
 
-      // Verify caching: modify database config, but ensure the cached instance is still returned
+      // Verify Redis state directly
+      const redisState = await redis.hGetAll("bucket:token-client");
+      expect(redisState).not.toBeNull();
+      expect(parseFloat(redisState.tokens)).toBeCloseTo(6.0, 2);
+
+      // Verify immediate config change: modify database config and ensure the new limits apply on the next check
       await upsertClientConfig("token-client", {
         algorithm: Algorithm.TOKEN_BUCKET,
         requestsPerSecond: 100,
         burstSize: 200,
       });
 
-      const cachedBucket = await getOrCreateBucket("token-client");
-      expect(cachedBucket.capacity).toBe(7); // unchanged due to in-memory caching
-      expect(cachedBucket.refillRatePerSecond).toBe(3.5);
+      const resAfterConfigChange = await getOrCreateBucket("token-client");
+      expect(resAfterConfigChange.limit).toBe(200); // changed immediately due to no in-memory cache
+    });
+
+    it("should simulate a server restart by showing state survives when no in-memory cache exists", async () => {
+      await upsertClientConfig("restart-client", {
+        algorithm: Algorithm.TOKEN_BUCKET,
+        requestsPerSecond: 1.0,
+        burstSize: 5,
+      });
+
+      // Consume 1 token
+      const res1 = await getOrCreateBucket("restart-client");
+      expect(res1.allowed).toBe(true);
+      expect(res1.remaining).toBe(4);
+
+      // Verify that state exists in Redis
+      const stateBefore = await redis.hGetAll("bucket:restart-client");
+      expect(parseFloat(stateBefore.tokens)).toBeCloseTo(4, 2);
+
+      // Call getOrCreateBucket again (with no map, this is equivalent to restart)
+      const res2 = await getOrCreateBucket("restart-client");
+      expect(res2.allowed).toBe(true);
+      expect(res2.remaining).toBe(3);
+    });
+
+    it("should correctly resume refill math from lastRefillTimestamp on rehydration", async () => {
+      await upsertClientConfig("rehydrate-client", {
+        algorithm: Algorithm.TOKEN_BUCKET,
+        requestsPerSecond: 1.0, // 1 token/sec
+        burstSize: 5,
+      });
+
+      const now = Date.now();
+
+      // Seed Redis state: 1 token, refilled 3 seconds ago
+      await redis.hSet("bucket:rehydrate-client", {
+        tokens: "1.0",
+        lastRefillTimestamp: (now - 3000).toString(),
+      });
+
+      // Rehydrate:
+      // - base tokens = 1.0
+      // - refilled = 3.0 (3s * 1/s)
+      // - pre-consume = 4.0
+      // - remaining = 3.0
+      const res = await getOrCreateBucket("rehydrate-client", now);
+      expect(res.allowed).toBe(true);
+      expect(res.remaining).toBe(3);
+    });
+
+    it("should fail-open and return degraded status if Redis is unavailable", async () => {
+      await upsertClientConfig("fail-open-client", {
+        algorithm: Algorithm.TOKEN_BUCKET,
+        requestsPerSecond: 1.0,
+        burstSize: 5,
+      });
+
+      // Disconnect Redis client physically to trigger isOpen/isReady = false
+      if (redis.isOpen) {
+        await redis.disconnect();
+      }
+
+      try {
+        const res = await request(testApp).post("/check/fail-open-client");
+        expect(res.status).toBe(200);
+        expect(res.headers["x-ratelimiter-bypassed"]).toBe("true");
+        expect(res.body.allowed).toBe(true);
+        expect(res.body.remaining).toBe(4); // fresh in-memory-only bucket allows it
+      } finally {
+        // Reconnect Redis so subsequent tests can run
+        if (!redis.isOpen) {
+          await redis.connect();
+        }
+      }
+    });
+
+    it("should fail-open and return degraded status if a Redis operation throws", async () => {
+      await upsertClientConfig("fail-throw-client", {
+        algorithm: Algorithm.TOKEN_BUCKET,
+        requestsPerSecond: 1.0,
+        burstSize: 5,
+      });
+
+      // Spy on redisRepository.getBucketState to throw an error
+      const getBucketStateSpy = vi.spyOn(redisRepository, "getBucketState").mockRejectedValue(new Error("Redis connection timeout"));
+
+      try {
+        const res = await request(testApp).post("/check/fail-throw-client");
+        expect(res.status).toBe(200);
+        expect(res.headers["x-ratelimiter-bypassed"]).toBe("true");
+        expect(res.body.allowed).toBe(true);
+        expect(res.body.remaining).toBe(4);
+      } finally {
+        getBucketStateSpy.mockRestore();
+      }
+    });
+
+    it("should refund consumed tokens on subsequent check if write to Redis fails", async () => {
+      await upsertClientConfig("refund-client", {
+        algorithm: Algorithm.TOKEN_BUCKET,
+        requestsPerSecond: 1.0,
+        burstSize: 5,
+      });
+
+      // First check - normal success
+      const res1 = await request(testApp).post("/check/refund-client");
+      expect(res1.body.remaining).toBe(4);
+
+      // Mock write failure on redisRepository.saveBucketState
+      const saveBucketStateSpy = vi.spyOn(redisRepository, "saveBucketState").mockRejectedValue(new Error("Redis write failure"));
+
+      try {
+        // Second check - tryConsume succeeds but save fails
+        const res2 = await request(testApp).post("/check/refund-client");
+        expect(res2.status).toBe(200);
+        expect(res2.headers["x-ratelimiter-bypassed"]).toBe("true");
+        expect(res2.body.remaining).toBe(3); // computed remaining was 3
+      } finally {
+        saveBucketStateSpy.mockRestore();
+      }
+
+      // Third check - Redis writes work again. Next check should re-read stale state (which has 4 remaining tokens)
+      const res3 = await request(testApp).post("/check/refund-client");
+      expect(res3.body.remaining).toBe(3); // 4 - 1 = 3 instead of 2 (demonstrating the refund gap)
     });
   });
 

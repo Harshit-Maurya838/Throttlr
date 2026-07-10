@@ -12,13 +12,16 @@ router.post("/check/:clientKey", async (req: Request, res: Response) => {
   const { clientKey } = req.params;
   
   try {
-    const bucket = await getOrCreateBucket(clientKey);
-    const result = bucket.tryConsume(Date.now());
+    const result = await getOrCreateBucket(clientKey);
     
+    if (result.degraded) {
+      res.setHeader("X-RateLimiter-Bypassed", "true");
+    }
+
     res.status(200).json({
       allowed: result.allowed,
       remaining: result.remaining,
-      limit: bucket.capacity,
+      limit: result.limit,
       resetAt: result.resetAt,
     });
   } catch (error) {
