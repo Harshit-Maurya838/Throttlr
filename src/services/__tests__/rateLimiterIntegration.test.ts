@@ -197,8 +197,8 @@ describe("Phase 3 Integration & Unit Tests", () => {
         burstSize: 5,
       });
 
-      // Spy on redisRepository.getBucketState to throw an error
-      const getBucketStateSpy = vi.spyOn(redisRepository, "getBucketState").mockRejectedValue(new Error("Redis connection timeout"));
+      // Spy on redisRepository.checkAndConsume to throw an error
+      const checkAndConsumeSpy = vi.spyOn(redisRepository, "checkAndConsume").mockRejectedValue(new Error("Redis connection timeout"));
 
       try {
         const res = await request(testApp).post("/check/fail-throw-client");
@@ -207,37 +207,8 @@ describe("Phase 3 Integration & Unit Tests", () => {
         expect(res.body.allowed).toBe(true);
         expect(res.body.remaining).toBe(4);
       } finally {
-        getBucketStateSpy.mockRestore();
+        checkAndConsumeSpy.mockRestore();
       }
-    });
-
-    it("should refund consumed tokens on subsequent check if write to Redis fails", async () => {
-      await upsertClientConfig("refund-client", {
-        algorithm: Algorithm.TOKEN_BUCKET,
-        requestsPerSecond: 1.0,
-        burstSize: 5,
-      });
-
-      // First check - normal success
-      const res1 = await request(testApp).post("/check/refund-client");
-      expect(res1.body.remaining).toBe(4);
-
-      // Mock write failure on redisRepository.saveBucketState
-      const saveBucketStateSpy = vi.spyOn(redisRepository, "saveBucketState").mockRejectedValue(new Error("Redis write failure"));
-
-      try {
-        // Second check - tryConsume succeeds but save fails
-        const res2 = await request(testApp).post("/check/refund-client");
-        expect(res2.status).toBe(200);
-        expect(res2.headers["x-ratelimiter-bypassed"]).toBe("true");
-        expect(res2.body.remaining).toBe(3); // computed remaining was 3
-      } finally {
-        saveBucketStateSpy.mockRestore();
-      }
-
-      // Third check - Redis writes work again. Next check should re-read stale state (which has 4 remaining tokens)
-      const res3 = await request(testApp).post("/check/refund-client");
-      expect(res3.body.remaining).toBe(3); // 4 - 1 = 3 instead of 2 (demonstrating the refund gap)
     });
   });
 
@@ -387,6 +358,39 @@ describe("Phase 3 Integration & Unit Tests", () => {
       expect(res4.status).toBe(200);
       expect(res4.body.allowed).toBe(false);
       expect(res4.body.remaining).toBe(0);
+    });
+
+    it("should process concurrent requests without race conditions (exactly capacity requests allowed)", async () => {
+      const clientKey = "concurrency-client";
+      const burstSize = 20;
+
+      await upsertClientConfig(clientKey, {
+        algorithm: Algorithm.TOKEN_BUCKET,
+        requestsPerSecond: 1.0,
+        burstSize,
+      });
+
+      // Run the concurrency execution 10 times to ensure safety against intermittent race conditions
+      for (let iteration = 1; iteration <= 10; iteration++) {
+        // Clear Redis state for this client before each iteration
+        await redis.del(`bucket:${clientKey}`);
+
+        const numRequests = 50;
+        const promises = Array.from({ length: numRequests }, () =>
+          request(testApp).post(`/check/${clientKey}`)
+        );
+
+        const responses = await Promise.all(promises);
+
+        const allowedCount = responses.filter((res) => res.body.allowed === true).length;
+        const deniedCount = responses.filter((res) => res.body.allowed === false).length;
+
+        // Log iteration results to satisfy "show me actual pass/fail output across all iterations"
+        console.log(`[CONCURRENCY TEST] Iteration ${iteration}: allowed=${allowedCount}, denied=${deniedCount}`);
+
+        expect(allowedCount).toBe(burstSize);
+        expect(deniedCount).toBe(numRequests - burstSize);
+      }
     });
   });
 });

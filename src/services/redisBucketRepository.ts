@@ -1,8 +1,92 @@
 import { redis } from "../lib/redis";
+import * as fs from "fs";
+import * as path from "path";
 
 export interface RedisBucketState {
   tokens: number;
   lastRefillTimestamp: number;
+}
+
+export interface CheckConsumeResult {
+  allowed: boolean;
+  remaining: number;
+  resetAt: number;
+}
+
+let scriptSha: string | null = null;
+let scriptContent: string = "";
+const scriptPath = path.join(__dirname, "luaScripts", "tokenBucket.lua");
+
+function loadScriptContent(): string {
+  if (!scriptContent) {
+    scriptContent = fs.readFileSync(scriptPath, "utf-8");
+  }
+  return scriptContent;
+}
+
+async function getOrLoadSha(): Promise<string> {
+  if (!scriptSha) {
+    const content = loadScriptContent();
+    scriptSha = await redis.scriptLoad(content);
+  }
+  return scriptSha;
+}
+
+/**
+ * Executes the atomic check-and-consume Lua script on Redis.
+ * Falls back to EVAL if EVALSHA returns NOSCRIPT.
+ */
+export async function checkAndConsume(
+  clientKey: string,
+  capacity: number,
+  refillRatePerSecond: number,
+  now: number,
+  tokensRequested: number = 1
+): Promise<CheckConsumeResult> {
+  const key = `bucket:${clientKey}`;
+  const sha = await getOrLoadSha();
+  const content = loadScriptContent();
+
+  let response: any;
+  try {
+    response = await redis.evalSha(sha, {
+      keys: [key],
+      arguments: [
+        capacity.toString(),
+        refillRatePerSecond.toString(),
+        now.toString(),
+        tokensRequested.toString(),
+      ],
+    });
+  } catch (error: any) {
+    if (error.message && error.message.includes("NOSCRIPT")) {
+      response = await redis.eval(content, {
+        keys: [key],
+        arguments: [
+          capacity.toString(),
+          refillRatePerSecond.toString(),
+          now.toString(),
+          tokensRequested.toString(),
+        ],
+      });
+    } else {
+      throw error;
+    }
+  }
+
+  if (!Array.isArray(response) || response.length < 3) {
+    throw new Error(`Unexpected response structure from Redis Lua script: ${JSON.stringify(response)}`);
+  }
+
+  const allowed = response[0] === 1;
+  const remaining = typeof response[1] === "number" ? response[1] : parseInt(response[1], 10);
+  const resetAt = typeof response[2] === "number" ? response[2] : parseInt(response[2], 10);
+
+  return {
+    allowed,
+    remaining,
+    resetAt,
+  };
 }
 
 /**

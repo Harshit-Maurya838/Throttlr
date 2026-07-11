@@ -51,14 +51,14 @@ function handleRedisUnavailable(
 
 /**
  * Retrieves/rehydrates the rate-limiting bucket for a given client key,
- * queries PostgreSQL for config, reads/writes state from/to Redis,
- * and performs the consumption check with fail-open resiliency.
+ * queries PostgreSQL for config, executes the consumption check atomically using
+ * a Redis Lua script, and supports fail-open resiliency.
  * 
- * NOTE: This design incurs a stacked per-request cost:
+ * NOTE: This design incurs a per-request cost:
  * 1. Postgres READ (fetch client config)
- * 2. Redis READ (fetch bucket state)
- * 3. Redis WRITE (save updated bucket state)
- * This is a known performance tradeoff for Phase 3, to be optimized in future phases.
+ * 2. One atomic Redis EVAL / EVALSHA (checks and consumes tokens)
+ * This is an optimized design for Phase 4 to ensure concurrency safety. The exact
+ * latency characteristics will be measured in Phase 7's load test.
  * 
  * @param clientKey Unique key identifier for the client service.
  * @param now Optional timestamp override for testing.
@@ -82,65 +82,26 @@ export async function getOrCreateBucket(
     return handleRedisUnavailable(config, now);
   }
 
-  let bucketState: redisRepository.RedisBucketState | null = null;
   try {
-    // Fetch bucket state from Redis
-    bucketState = await redisRepository.getBucketState(clientKey);
-  } catch (error) {
-    // Fail-open if read operation throws
-    return handleRedisUnavailable(config, now, error);
-  }
-
-  let bucket: TokenBucket;
-  if (!bucketState) {
-    // First-ever check: construct fresh
-    bucket = new TokenBucket({
-      capacity: config.burstSize,
-      refillRatePerSecond: config.requestsPerSecond,
-    });
-  } else {
-    // Rehydrate using saved tokens and timestamp
-    bucket = new TokenBucket({
-      capacity: config.burstSize,
-      refillRatePerSecond: config.requestsPerSecond,
-      initialTokens: bucketState.tokens,
-      lastRefillTimestamp: bucketState.lastRefillTimestamp,
-    });
-  }
-
-  // Consume 1 token
-  const result = bucket.tryConsume(now);
-
-  try {
-    // Save the updated state back to Redis
-    await redisRepository.saveBucketState(clientKey, {
-      tokens: bucket.tokens,
-      lastRefillTimestamp: bucket.lastRefillTimestamp,
-    });
-  } catch (error) {
-    // Log the write failure, but return the result to the caller (fail-open/degraded)
-    // NOTE: A failed write here means the next check() will re-read stale state,
-    // effectively "refunding" whatever was consumed this request.
-    console.error(
-      `[ALERT] Failed to save bucket state to Redis for client ${clientKey}. Next check will re-read stale state (refund gap). Error:`,
-      error
+    const result = await redisRepository.checkAndConsume(
+      clientKey,
+      config.burstSize,
+      config.requestsPerSecond,
+      now,
+      1
     );
     return {
       allowed: result.allowed,
       remaining: result.remaining,
       resetAt: result.resetAt,
       limit: config.burstSize,
-      degraded: true,
+      degraded: false,
     };
+  } catch (error) {
+    // If checkAndConsume fails (e.g. redis connection timeout / write failure during script execution),
+    // trigger fail-open path
+    return handleRedisUnavailable(config, now, error);
   }
-
-  return {
-    allowed: result.allowed,
-    remaining: result.remaining,
-    resetAt: result.resetAt,
-    limit: config.burstSize,
-    degraded: false,
-  };
 }
 
 /**
