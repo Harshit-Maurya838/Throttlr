@@ -2,6 +2,7 @@ import express from "express";
 import { env } from "./config/env";
 import { redis } from "./lib/redis";
 import { prisma } from "./lib/prisma";
+import { initializeScripts } from "./services/redisBucketRepository";
 import healthRouter from "./routes/health";
 import checkRouter from "./routes/check";
 import adminRouter from "./routes/admin";
@@ -21,6 +22,11 @@ async function startServer() {
     // connection to Redis
     console.log("Connecting to Redis server...");
     await redis.connect();
+
+    // eagerly load rate limiter Lua scripts
+    console.log("Eagerly loading Redis Lua scripts...");
+    await initializeScripts();
+    console.log("Redis Lua scripts loaded.");
 
     // verify database connectivity
     console.log("Connecting to PostgreSQL database...");

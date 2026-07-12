@@ -29,6 +29,7 @@ describe("Phase 3 Integration & Unit Tests", () => {
     if (!redis.isOpen) {
       await redis.connect();
     }
+    await redisRepository.initializeScripts();
   });
 
   // Clear database and in-memory bucket store before each test to ensure isolation
@@ -77,7 +78,7 @@ describe("Phase 3 Integration & Unit Tests", () => {
       );
     });
 
-    it("should throw NotImplementedError if client is configured with SLIDING_WINDOW", async () => {
+    it("should successfully evaluate SLIDING_WINDOW client using getOrCreateBucket", async () => {
       await upsertClientConfig("sliding-client", {
         algorithm: Algorithm.SLIDING_WINDOW,
         requestsPerSecond: 2.0,
@@ -85,9 +86,11 @@ describe("Phase 3 Integration & Unit Tests", () => {
         windowMs: 60000,
       });
 
-      await expect(getOrCreateBucket("sliding-client")).rejects.toThrow(
-        NotImplementedError
-      );
+      const result = await getOrCreateBucket("sliding-client");
+      expect(result.allowed).toBe(true);
+      expect(result.remaining).toBe(4);
+      expect(result.limit).toBe(5);
+      expect(result.degraded).toBe(false);
     });
 
     it("should create bucket state in Redis and immediately propagate config changes", async () => {
@@ -309,20 +312,40 @@ describe("Phase 3 Integration & Unit Tests", () => {
       expect(res.body.error).toContain("Client not configured");
     });
 
-    it("POST /check/:clientKey should return 501 if client is configured with SLIDING_WINDOW", async () => {
-      // Add sliding window config
+    it("POST /check/:clientKey should allow and enforce rate limits for configured SLIDING_WINDOW client", async () => {
+      // Add sliding window config with limit 3 (using burstSize as limit) and windowMs 1000
       await request(testApp)
         .post("/admin/clients/sliding-key")
         .send({
           algorithm: "SLIDING_WINDOW",
-          requestsPerSecond: 2.0,
-          burstSize: 5,
+          requestsPerSecond: 1.0, // required by schema but unused
+          burstSize: 3,
           windowMs: 1000,
         });
 
-      const res = await request(testApp).post("/check/sliding-key");
-      expect(res.status).toBe(501);
-      expect(res.body.error).toContain("SLIDING_WINDOW algorithm is not implemented yet");
+      // 1st request - allowed
+      const res1 = await request(testApp).post("/check/sliding-key");
+      expect(res1.status).toBe(200);
+      expect(res1.body.allowed).toBe(true);
+      expect(res1.body.remaining).toBe(2);
+
+      // 2nd request - allowed
+      const res2 = await request(testApp).post("/check/sliding-key");
+      expect(res2.status).toBe(200);
+      expect(res2.body.allowed).toBe(true);
+      expect(res2.body.remaining).toBe(1);
+
+      // 3rd request - allowed
+      const res3 = await request(testApp).post("/check/sliding-key");
+      expect(res3.status).toBe(200);
+      expect(res3.body.allowed).toBe(true);
+      expect(res3.body.remaining).toBe(0);
+
+      // 4th request - rejected
+      const res4 = await request(testApp).post("/check/sliding-key");
+      expect(res4.status).toBe(200);
+      expect(res4.body.allowed).toBe(false);
+      expect(res4.body.remaining).toBe(0);
     });
 
     it("POST /check/:clientKey should allow and enforce rate limits for configured TOKEN_BUCKET client", async () => {
@@ -390,6 +413,40 @@ describe("Phase 3 Integration & Unit Tests", () => {
 
         expect(allowedCount).toBe(burstSize);
         expect(deniedCount).toBe(numRequests - burstSize);
+      }
+    });
+
+    it("should process concurrent requests for SLIDING_WINDOW without race conditions (exactly limit requests allowed)", async () => {
+      const clientKey = "concurrency-sliding-client";
+      const limit = 20;
+
+      await upsertClientConfig(clientKey, {
+        algorithm: Algorithm.SLIDING_WINDOW,
+        requestsPerSecond: 1.0, // unused
+        burstSize: limit, // limit
+        windowMs: 1000,
+      });
+
+      // Run the concurrency execution 10 times to ensure safety against intermittent race conditions
+      for (let iteration = 1; iteration <= 10; iteration++) {
+        // Clear Redis state for this client before each iteration
+        await redis.del(`bucket:sw:${clientKey}`);
+
+        const numRequests = 50;
+        const promises = Array.from({ length: numRequests }, () =>
+          request(testApp).post(`/check/${clientKey}`)
+        );
+
+        const responses = await Promise.all(promises);
+
+        const allowedCount = responses.filter((res) => res.body.allowed === true).length;
+        const deniedCount = responses.filter((res) => res.body.allowed === false).length;
+
+        // Log iteration results
+        console.log(`[SLIDING WINDOW CONCURRENCY TEST] Iteration ${iteration}: allowed=${allowedCount}, denied=${deniedCount}`);
+
+        expect(allowedCount).toBe(limit);
+        expect(deniedCount).toBe(numRequests - limit);
       }
     });
   });

@@ -1,4 +1,5 @@
 import { TokenBucket } from "../core/tokenBucket";
+import { SlidingWindowCounter } from "../core/slidingWindowCounter";
 import { getClientConfig } from "./clientConfigService";
 import { Algorithm, ClientConfig } from "@prisma/client";
 import { redis } from "../lib/redis";
@@ -20,8 +21,10 @@ export class NotImplementedError extends Error {
 
 /**
  * Fallback fail-open handler when Redis is unreachable or throws an error.
- * Logs an alert and evaluates rate limiting using a transient in-memory TokenBucket,
+ * Logs an alert and evaluates rate limiting using a transient in-memory rate limiter,
  * guaranteeing the request is allowed (fail-open) while returning degraded status.
+ *
+ * NOTE: Sliding Window Counter uses burstSize as the limit during in-memory fallback.
  */
 function handleRedisUnavailable(
   config: ClientConfig,
@@ -33,18 +36,31 @@ function handleRedisUnavailable(
     error || "Redis connection not ready/open"
   );
 
-  const transientBucket = new TokenBucket({
-    capacity: config.burstSize,
-    refillRatePerSecond: config.requestsPerSecond,
-  });
+  let result;
+  let limit;
 
-  const result = transientBucket.tryConsume(now);
+  if (config.algorithm === Algorithm.SLIDING_WINDOW) {
+    const windowMs = config.windowMs || 1000;
+    const transientCounter = new SlidingWindowCounter({
+      limit: config.burstSize,
+      windowMs: windowMs,
+    });
+    result = transientCounter.tryConsume(now);
+    limit = config.burstSize;
+  } else {
+    const transientBucket = new TokenBucket({
+      capacity: config.burstSize,
+      refillRatePerSecond: config.requestsPerSecond,
+    });
+    result = transientBucket.tryConsume(now);
+    limit = config.burstSize;
+  }
 
   return {
     allowed: true, // Fail-open: always allow
     remaining: result.remaining,
     resetAt: result.resetAt,
-    limit: config.burstSize,
+    limit,
     degraded: true,
   };
 }
@@ -57,7 +73,7 @@ function handleRedisUnavailable(
  * NOTE: This design incurs a per-request cost:
  * 1. Postgres READ (fetch client config)
  * 2. One atomic Redis EVAL / EVALSHA (checks and consumes tokens)
- * This is an optimized design for Phase 4 to ensure concurrency safety. The exact
+ * This is an optimized design to ensure concurrency safety. The exact
  * latency characteristics will be measured in Phase 7's load test.
  * 
  * @param clientKey Unique key identifier for the client service.
@@ -73,33 +89,45 @@ export async function getOrCreateBucket(
     throw new ClientNotConfiguredError(clientKey);
   }
 
-  if (config.algorithm === Algorithm.SLIDING_WINDOW) {
-    throw new NotImplementedError("SLIDING_WINDOW algorithm is not implemented yet.");
-  }
-
   // Pre-check Redis readiness
   if (!redis.isOpen || !redis.isReady) {
     return handleRedisUnavailable(config, now);
   }
 
   try {
-    const result = await redisRepository.checkAndConsume(
-      clientKey,
-      config.burstSize,
-      config.requestsPerSecond,
-      now,
-      1
-    );
-    return {
-      allowed: result.allowed,
-      remaining: result.remaining,
-      resetAt: result.resetAt,
-      limit: config.burstSize,
-      degraded: false,
-    };
+    if (config.algorithm === Algorithm.SLIDING_WINDOW) {
+      const windowMs = config.windowMs || 1000;
+      const result = await redisRepository.checkAndConsumeSlidingWindow(
+        clientKey,
+        config.burstSize,
+        windowMs,
+        now
+      );
+      return {
+        allowed: result.allowed,
+        remaining: result.remaining,
+        resetAt: result.resetAt,
+        limit: config.burstSize,
+        degraded: false,
+      };
+    } else {
+      const result = await redisRepository.checkAndConsume(
+        clientKey,
+        config.burstSize,
+        config.requestsPerSecond,
+        now,
+        1
+      );
+      return {
+        allowed: result.allowed,
+        remaining: result.remaining,
+        resetAt: result.resetAt,
+        limit: config.burstSize,
+        degraded: false,
+      };
+    }
   } catch (error) {
-    // If checkAndConsume fails (e.g. redis connection timeout / write failure during script execution),
-    // trigger fail-open path
+    // If Redis operation fails, trigger fail-open path
     return handleRedisUnavailable(config, now, error);
   }
 }

@@ -28,6 +28,9 @@ router.post(
     }
 
     // Validate requestsPerSecond
+    // NOTE: For the SLIDING_WINDOW algorithm, requestsPerSecond is currently ignored
+    // because burstSize acts as the request limit within windowMs. We still require
+    // and validate it here to remain consistent with the database model/config schema.
     if (
       typeof requestsPerSecond !== "number" ||
       requestsPerSecond <= 0 ||
