@@ -118,4 +118,16 @@ describe("SlidingWindowCounter Class", () => {
     expect(resAlmostDecayed.allowed).toBe(true);
     expect(resAlmostDecayed.remaining).toBe(8); // limit 10 - floor(0.01 + 1) = 8
   });
+
+  it("should guarantee that remaining is exactly 0 (not negative) on a denied request", () => {
+    const counter = new SlidingWindowCounter({ limit: 5, windowMs: 1000 });
+    // First fill the window with 5 requests
+    for (let i = 0; i < 5; i++) {
+      expect(counter.tryConsume(1000).allowed).toBe(true);
+    }
+    // The 6th request will be denied.
+    const res = counter.tryConsume(1000);
+    expect(res.allowed).toBe(false);
+    expect(res.remaining).toBe(0);
+  });
 });

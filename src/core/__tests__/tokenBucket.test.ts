@@ -136,4 +136,12 @@ describe('TokenBucket Class', () => {
     // Refill time = 3 / 2 = 1.5s = 1500ms
     expect(result2.resetAt).toBe(startTime + 1500);
   });
+
+  it('should guarantee that remaining is exactly 0 (not negative) on a denied request', () => {
+    const bucket = new TokenBucket({ capacity: 5, refillRatePerSecond: 1, initialTokens: 0.5 });
+    // First attempt tries to consume 1 token. Since initialTokens = 0.5 < 1, it should be denied.
+    const res = bucket.tryConsume(1000);
+    expect(res.allowed).toBe(false);
+    expect(res.remaining).toBe(0);
+  });
 });

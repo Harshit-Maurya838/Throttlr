@@ -450,4 +450,143 @@ describe("Phase 3 Integration & Unit Tests", () => {
       }
     });
   });
+
+  describe("Rate Limit HTTP Headers Integration Tests", () => {
+    it("should set correct X-RateLimit headers for TOKEN_BUCKET client on ALLOW and ensure Retry-After is absent", async () => {
+      await request(testApp)
+        .post("/admin/clients/tb-header-client")
+        .send({
+          algorithm: "TOKEN_BUCKET",
+          requestsPerSecond: 1.0,
+          burstSize: 5,
+        });
+
+      const res = await request(testApp).post("/check/tb-header-client");
+      expect(res.status).toBe(200);
+      expect(res.headers["x-ratelimit-limit"]).toBe("5");
+      expect(res.headers["x-ratelimit-remaining"]).toBe("4");
+      expect(res.headers["x-ratelimit-reset"]).toBeDefined();
+      
+      // Assert X-RateLimit-Reset is in Unix seconds (e.g. 10 digits long, not 13 ms digits)
+      const resetHeader = res.headers["x-ratelimit-reset"];
+      expect(resetHeader.length).toBeLessThanOrEqual(10);
+      expect(Number(resetHeader)).toBeGreaterThan(0);
+      
+      // Assert Retry-After is absent on ALLOW response
+      expect(res.headers["retry-after"]).toBeUndefined();
+    });
+
+    it("should set Retry-After on DENY for TOKEN_BUCKET and verify remaining is 0", async () => {
+      await request(testApp)
+        .post("/admin/clients/tb-deny-client")
+        .send({
+          algorithm: "TOKEN_BUCKET",
+          requestsPerSecond: 0.5,
+          burstSize: 2,
+        });
+
+      // Consume 2 tokens (capacity is 2)
+      await request(testApp).post("/check/tb-deny-client");
+      await request(testApp).post("/check/tb-deny-client");
+
+      // 3rd request should be denied
+      const res = await request(testApp).post("/check/tb-deny-client");
+      expect(res.status).toBe(200);
+      expect(res.body.allowed).toBe(false);
+      expect(res.headers["x-ratelimit-remaining"]).toBe("0");
+      expect(res.headers["x-ratelimit-limit"]).toBe("2");
+      expect(res.headers["x-ratelimit-reset"]).toBeDefined();
+      
+      // Assert Retry-After is present, positive integer, and matches resetAt diff
+      expect(res.headers["retry-after"]).toBeDefined();
+      const retryAfter = Number(res.headers["retry-after"]);
+      expect(retryAfter).toBeGreaterThan(0);
+      
+      // Math check:
+      const resetAtMs = res.body.resetAt;
+      const expectedRetryAfter = Math.max(0, Math.ceil((resetAtMs - Date.now()) / 1000));
+      expect(retryAfter).toBeGreaterThanOrEqual(expectedRetryAfter - 1);
+      expect(retryAfter).toBeLessThanOrEqual(expectedRetryAfter + 1);
+    });
+
+    it("should set correct headers for SLIDING_WINDOW client on both ALLOW and DENY", async () => {
+      await request(testApp)
+        .post("/admin/clients/sw-header-client")
+        .send({
+          algorithm: "SLIDING_WINDOW",
+          requestsPerSecond: 1.0,
+          burstSize: 2,
+          windowMs: 5000,
+        });
+
+      // 1st request (ALLOW)
+      const res1 = await request(testApp).post("/check/sw-header-client");
+      expect(res1.status).toBe(200);
+      expect(res1.headers["x-ratelimit-limit"]).toBe("2");
+      expect(res1.headers["x-ratelimit-remaining"]).toBe("1");
+      expect(res1.headers["x-ratelimit-reset"]).toBeDefined();
+      expect(res1.headers["retry-after"]).toBeUndefined();
+
+      // 2nd request (ALLOW)
+      const res2 = await request(testApp).post("/check/sw-header-client");
+      expect(res2.status).toBe(200);
+      expect(res2.headers["x-ratelimit-remaining"]).toBe("0");
+
+      // 3rd request (DENY)
+      const res3 = await request(testApp).post("/check/sw-header-client");
+      expect(res3.status).toBe(200);
+      expect(res3.body.allowed).toBe(false);
+      expect(res3.headers["x-ratelimit-limit"]).toBe("2");
+      expect(res3.headers["x-ratelimit-remaining"]).toBe("0");
+      expect(res3.headers["x-ratelimit-reset"]).toBeDefined();
+      expect(res3.headers["retry-after"]).toBeDefined();
+      
+      const retryAfter = Number(res3.headers["retry-after"]);
+      expect(retryAfter).toBeGreaterThan(0);
+      expect(retryAfter).toBeLessThanOrEqual(5); // window is 5s
+    });
+
+    it("should omit X-RateLimit headers and Retry-After but keep X-RateLimiter-Bypassed in degraded/fail-open mode", async () => {
+      await upsertClientConfig("fail-header-client", {
+        algorithm: Algorithm.TOKEN_BUCKET,
+        requestsPerSecond: 1.0,
+        burstSize: 5,
+      });
+
+      // Spy on redisRepository.checkAndConsume to throw an error
+      const checkAndConsumeSpy = vi.spyOn(redisRepository, "checkAndConsume").mockRejectedValue(new Error("Redis connection timeout"));
+
+      try {
+        const res = await request(testApp).post("/check/fail-header-client");
+        expect(res.status).toBe(200);
+        expect(res.headers["x-ratelimiter-bypassed"]).toBe("true");
+        
+        // Verify Option A: all standard rate-limit headers are omitted
+        expect(res.headers["x-ratelimit-limit"]).toBeUndefined();
+        expect(res.headers["x-ratelimit-remaining"]).toBeUndefined();
+        expect(res.headers["x-ratelimit-reset"]).toBeUndefined();
+        expect(res.headers["retry-after"]).toBeUndefined();
+      } finally {
+        checkAndConsumeSpy.mockRestore();
+      }
+    });
+
+    it("should verify the X-RateLimit-Reset unit conversion explicitly (milliseconds to Unix seconds)", async () => {
+      await request(testApp)
+        .post("/admin/clients/tb-unit-client")
+        .send({
+          algorithm: "TOKEN_BUCKET",
+          requestsPerSecond: 1.0,
+          burstSize: 5,
+        });
+
+      const res = await request(testApp).post("/check/tb-unit-client");
+      expect(res.status).toBe(200);
+      
+      const resetAtMs = res.body.resetAt; // Internal ms
+      const resetHeader = Number(res.headers["x-ratelimit-reset"]); // Unix seconds
+      
+      expect(resetHeader).toBe(Math.ceil(resetAtMs / 1000));
+    });
+  });
 });
