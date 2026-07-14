@@ -61,7 +61,7 @@ router.post("/check/:clientKey", async (req: Request, res: Response) => {
     // Set headers using helper function
     setRateLimitHeaders(res, result);
 
-    res.status(200).json({
+    res.status(result.allowed ? 200 : 429).json({
       allowed: result.allowed,
       remaining: result.remaining,
       limit: result.limit,

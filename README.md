@@ -38,32 +38,29 @@ Throttlr runs as a centralized shared infrastructure. Consuming APIs and service
   └─────────────┘ └─────────────┘
 ```
 
-### Known Limitations (Phase 3)
+### Known Limitations
 
 - **Unprotected Admin Endpoints**: Admin routes currently have no authentication or API-key protection.
-- **Refund-Gap on Redis Write Failure**: A failed Redis write after a successful token consumption causes the next check to re-read stale state, effectively refunding that request. Resolved in Phase 4 via atomic Lua script execution.
-- **No TTL on Redis Bucket Keys**: Bucket keys in Redis have no TTL — an accepted tradeoff for now, meaning unbounded growth across many distinct clients is not yet addressed.
-- **Unsupported Sliding Window Enforcement**: While `SLIDING_WINDOW` client configurations are accepted and stored, the check API will return `501 Not Implemented` if evaluated.
+- **Uncached Database Configuration**: For every check request, the service queries PostgreSQL to read the client's rate-limiting config. This introduces a read bottleneck at extremely high scale.
+- **No TTL on Redis Bucket Keys**: Rate limit state keys in Redis do not have an expiration (TTL), meaning inactive or deprecated client keys are never automatically evicted.
 
 ## Features
 
-### Currently Implemented
+### Implemented
 
 - **Token Bucket Algorithm**: Mathematical token bucket limiter supporting fractional token accumulation and temporal refill.
-- **Per-Client Dynamic Configurations**: Dynamically configures rate limit capacities and refill rates per client key via PostgreSQL database records.
-- **Redis-Backed Persistence (State Survives Restart)**: Transient token bucket states are stored in Redis, ensuring state survives service restarts. Configuration changes made to active buckets take effect immediately (no restart or manual eviction needed) since bucket state is no longer cached in-memory.
+- **Sliding Window Counter Algorithm**: Memory-efficient sliding window counter approximation that prevents boundary-reset bursts with O(1) space complexity.
+- **Per-Client Dynamic Configurations**: Dynamically configures rate limit capacities, refill rates, and window parameters per client key via PostgreSQL database records.
+- **Redis-Backed Persistence**: Transient rate-limiter states are stored in Redis, ensuring state survives service restarts. Configuration changes made to active limits take effect immediately.
+- **Concurrency & Atomicity**: All rate-limit evaluations and writes are executed inside atomic Redis Lua scripts to eliminate race conditions under concurrent requests.
+- **Standard Rate Limit Headers**: Returns standard HTTP headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset`) on all checks. Denied requests return an `HTTP 429 Too Many Requests` status code along with a `Retry-After` header.
+- **Fail-Open Resilience**: Gracefully falls back to ALLOW (fail-open) if Redis is unavailable, returning `X-RateLimiter-Bypassed: true`.
 - **Client Configuration APIs**: `POST /admin/clients/:clientKey` and `GET /admin/clients/:clientKey` endpoints to manage rate limiter parameters.
-- **In-Memory Bucket Store**: Non-persistent in-memory store caching active client buckets (used as a testing/development seam).
-- **Rate Limit Check API**: POST `/check/:clientKey` route for evaluating request admissibility.
-- **Docker Infrastructure**: Multi-container setup orchestrating local PostgreSQL 16 and Redis 7 instances.
 - **Health Check Endpoint**: `/health` API for checking DB and Redis client connectivity status.
 
-### Planned / Roadmap
+## Load Testing & Performance
 
-- **Sliding Window Log Algorithm**: Sliding window counter-based rate-limiting mode. _(Note: client configurations are accepted, but checks on `SLIDING_WINDOW` clients return `501 Not Implemented` until Phase 5)_.
-- **Atomic Lua Scripting**: Atomic check-and-consume operations executed directly in Redis to avoid concurrency race conditions.
-- **Rate Limit Headers**: Return RFC-compliant headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`) on checks.
-- **Load Testing & Benchmarking Suite**: Complete benchmarking suites for validating performance under load.
+Throttlr has been load-tested under sustained high-throughput conditions utilizing k6. The service successfully sustained a peak throughput of 550 RPS with zero HTTP 5xx errors and a p95 latency under 4.8ms. A 1,000 VU concurrent correctness suite run 5 sequential times verified that the rate-limiter is completely race-condition-safe, allowing exactly 100 requests and denying exactly 900. For full methodology and findings, see the [LOAD_TEST_REPORT.md](LOAD_TEST_REPORT.md).
 
 ## Tech Stack
 
@@ -135,9 +132,47 @@ Throttlr runs as a centralized shared infrastructure. Consuming APIs and service
        -d '{"algorithm": "TOKEN_BUCKET", "requestsPerSecond": 2.0, "burstSize": 5}' \
        http://localhost:3000/admin/clients/my-service
      ```
-  2. Perform rate limit checks:
+  2. Perform rate limit checks (Allowed):
      ```bash
      curl -i -X POST http://localhost:3000/check/my-service
+     ```
+
+     Example allowed response:
+     ```http
+     HTTP/1.1 200 OK
+     X-RateLimit-Limit: 5
+     X-RateLimit-Remaining: 4
+     X-RateLimit-Reset: 1783987910
+     Content-Type: application/json
+
+     {
+       "allowed": true,
+       "remaining": 4,
+       "limit": 5,
+       "resetAt": 1783987909789
+     }
+     ```
+
+  3. Perform check when rate limit is exceeded (Denied):
+     ```bash
+     curl -i -X POST http://localhost:3000/check/my-service
+     ```
+
+     Example denied response:
+     ```http
+     HTTP/1.1 429 Too Many Requests
+     X-RateLimit-Limit: 5
+     X-RateLimit-Remaining: 0
+     X-RateLimit-Reset: 1783987910
+     Retry-After: 3
+     Content-Type: application/json
+
+     {
+       "allowed": false,
+       "remaining": 0,
+       "limit": 5,
+       "resetAt": 1783987909789
+     }
      ```
 
      > [!NOTE]
@@ -151,9 +186,9 @@ Throttlr runs as a centralized shared infrastructure. Consuming APIs and service
      > 
      > {
      >   "allowed": true,
-     >   "remaining": 4,
+     >   "remaining": 5,
      >   "limit": 5,
-     >   "resetAt": 1720743501000
+     >   "resetAt": 1783987909789
      > }
      > ```
 
@@ -184,10 +219,12 @@ rate-limiter-service/
 - [x] Phase 1: Core Token Bucket Algorithm (In-Memory)
 - [x] Phase 2: PostgreSQL Dynamic Configuration Integration
 - [x] Phase 3: Redis-Backed State Store
-- [ ] Phase 4: Concurrency Safety via Lua Scripts
-- [ ] Phase 5: Sliding Window Log Algorithm
-- [ ] Phase 6: Standard Rate Limit Headers
-- [ ] Phase 7: Load Testing & Performance Benchmarks
+- [x] Phase 4: Concurrency Safety via Lua Scripts
+- [x] Phase 5: Sliding Window Log Algorithm
+- [x] Phase 6: Standard Rate Limit Headers
+- [x] Phase 7: Load Testing & Performance Benchmarks
+- [ ] Stretch Goal: Distributed clustering & synchronization
+- [ ] Stretch Goal: Real-time traffic dashboard
 
 ## License
 

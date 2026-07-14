@@ -343,7 +343,7 @@ describe("Phase 3 Integration & Unit Tests", () => {
 
       // 4th request - rejected
       const res4 = await request(testApp).post("/check/sliding-key");
-      expect(res4.status).toBe(200);
+      expect(res4.status).toBe(429);
       expect(res4.body.allowed).toBe(false);
       expect(res4.body.remaining).toBe(0);
     });
@@ -378,7 +378,7 @@ describe("Phase 3 Integration & Unit Tests", () => {
 
       // 4th request - rejected
       const res4 = await request(testApp).post("/check/rate-client");
-      expect(res4.status).toBe(200);
+      expect(res4.status).toBe(429);
       expect(res4.body.allowed).toBe(false);
       expect(res4.body.remaining).toBe(0);
     });
@@ -491,7 +491,7 @@ describe("Phase 3 Integration & Unit Tests", () => {
 
       // 3rd request should be denied
       const res = await request(testApp).post("/check/tb-deny-client");
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(429);
       expect(res.body.allowed).toBe(false);
       expect(res.headers["x-ratelimit-remaining"]).toBe("0");
       expect(res.headers["x-ratelimit-limit"]).toBe("2");
@@ -534,7 +534,7 @@ describe("Phase 3 Integration & Unit Tests", () => {
 
       // 3rd request (DENY)
       const res3 = await request(testApp).post("/check/sw-header-client");
-      expect(res3.status).toBe(200);
+      expect(res3.status).toBe(429);
       expect(res3.body.allowed).toBe(false);
       expect(res3.headers["x-ratelimit-limit"]).toBe("2");
       expect(res3.headers["x-ratelimit-remaining"]).toBe("0");
