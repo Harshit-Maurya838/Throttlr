@@ -192,6 +192,108 @@ Throttlr has been load-tested under sustained high-throughput conditions utilizi
      > }
      > ```
 
+## Usage & Integration Guide
+
+Throttlr is designed to run as shared infrastructure rather than an application-level library. Consuming backend services call Throttlr before processing a request, similar to querying a database or a cache. It acts as a gatekeeper: it does not serve the end-user traffic directly but informs the consuming service whether a given client key has exceeded its limits.
+
+### 1. One-Time Client Registration
+
+Before a client key can be checked, its rate-limiting configuration must be registered. This is typically a one-time setup step executed during service provisioning or deployment, rather than dynamically on a per-request basis.
+
+To register a client named `public-signup-api` using the `TOKEN_BUCKET` algorithm with a capacity of 100 and a refill rate of 10 tokens per second:
+
+```bash
+curl -i -X POST -H "Content-Type: application/json" \
+  -d '{"algorithm": "TOKEN_BUCKET", "requestsPerSecond": 10.0, "burstSize": 100}' \
+  http://localhost:3000/admin/clients/public-signup-api
+```
+
+> [!WARNING]
+> Admin routes are currently unauthenticated (see [Known Limitations](#known-limitations)). Do not expose the `/admin` endpoints to the public internet.
+
+### 2. Checking Limits Before Gated Requests
+
+For each incoming request, the consuming backend service makes a POST request to `/check/:clientKey` to verify if the request should proceed.
+
+```bash
+curl -i -X POST http://localhost:3000/check/public-signup-api
+```
+
+#### Allowed Response (HTTP 200 OK)
+Returned when the client has remaining quota.
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 99
+X-RateLimit-Reset: 1783987910
+
+{
+  "allowed": true,
+  "remaining": 99,
+  "limit": 100,
+  "resetAt": 1783987909789
+}
+```
+
+#### Denied Response (HTTP 429 Too Many Requests)
+Returned when the client has exhausted their quota. The `Retry-After` header indicates the minimum number of seconds to wait before retrying.
+
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json; charset=utf-8
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1783987910
+Retry-After: 5
+
+{
+  "allowed": false,
+  "remaining": 0,
+  "limit": 100,
+  "resetAt": 1783987909789
+}
+```
+
+### 3. Example Middleware Integration
+
+Consuming backend services written in Node.js/TypeScript can protect endpoints by wrapping the rate-limit check in a custom Express middleware:
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+
+const THROTTLR_URL = process.env.THROTTLR_URL || 'http://localhost:3000';
+
+export async function rateLimitMiddleware(req: Request, res: Response, next: NextFunction) {
+  // Derive a unique client key (e.g., from an API key header or client IP)
+  const clientKey = req.header('x-api-key') || req.ip || 'anonymous';
+
+  try {
+    const response = await fetch(`${THROTTLR_URL}/check/${clientKey}`, {
+      method: 'POST'
+    });
+
+    if (response.status === 429) {
+      const retryAfter = response.headers.get('Retry-After');
+      if (retryAfter) {
+        res.setHeader('Retry-After', retryAfter);
+      }
+      res.status(429).json({ error: 'Too Many Requests' });
+      return; // Short-circuit the request pipeline
+    }
+
+    // For 200 OK (or other non-429 status codes), allow the request to proceed
+    next();
+  } catch (error) {
+    // FAIL-OPEN: If Throttlr is down/unreachable, fail open to prevent
+    // cascading failures in the primary service, matching Throttlr's internal philosophy.
+    console.error('Throttlr rate-limiter unreachable, failing open:', error);
+    next();
+  }
+}
+```
+
 ## Running Tests
 
 To run the Vitest unit tests:
